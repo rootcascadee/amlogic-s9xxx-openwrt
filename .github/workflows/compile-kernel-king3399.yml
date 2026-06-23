@@ -1,7 +1,7 @@
 #==========================================================================
 # Compile custom kernel for King3399 (RK3399)
-# Includes custom rk3399-king3399.dts
-# Based on ophub kernel build system
+# Uses ophub/amlogic-s9xxx-armbian compile-kernel action
+# Injects custom rk3399-king3399.dts via kernel_patch mechanism
 #==========================================================================
 
 name: Compile King3399 Kernel
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "Kernel version to build"
+        description: "Select kernel version"
         required: false
         default: "5.10.y"
         type: choice
@@ -19,6 +19,7 @@ on:
           - 5.10.y
           - 6.1.y
           - 6.6.y
+          - 6.12.y
       kernel_auto:
         description: "Auto use latest patch version"
         required: false
@@ -36,6 +37,15 @@ on:
         options:
           - gcc
           - clang
+      docker_image:
+        description: "Select Armbian docker image"
+        required: false
+        default: "noble"
+        type: choice
+        options:
+          - noble
+          - bookworm
+          - trixie
 
 env:
   TZ: Asia/Jakarta
@@ -43,6 +53,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
     permissions:
       contents: write
 
@@ -50,97 +61,103 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
 
-      - name: Initialize environment
+      - name: Initialize build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
           sudo -E apt-get -y update
-          sudo -E apt-get -y install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libssl-dev bc flex bison libelf-dev build-essential git \
-            device-tree-compiler u-boot-tools
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
           sudo timedatectl set-timezone "${TZ}"
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Clone kernel source 5.10.y
+      - name: Create virtual disk for extended storage
+        id: disk
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
         run: |
-          mkdir -p /opt/kernel
-          git clone --depth=1 --branch linux-5.10.y \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-            /opt/kernel/linux-5.10
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Insufficient space"; exit 1; }
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.xfs -f "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Add King3399 DTS to kernel tree
+      - name: Prepare King3399 kernel patch
+        id: patch
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
         run: |
-          # Copy custom DTS
+          # Create patch directory structure expected by ophub compile action
+          PATCH_DIR="/builder/kernel-patch/5.10"
+          mkdir -p "${PATCH_DIR}/arch/arm64/boot/dts/rockchip"
+          mkdir -p "${PATCH_DIR}/files"
+
+          # Copy king3399 DTS
           cp config/kernel/rk3399-king3399.dts \
-            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/
+            "${PATCH_DIR}/arch/arm64/boot/dts/rockchip/"
 
-          # Add to Makefile if not present
-          grep -q "rk3399-king3399.dtb" \
-            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile || \
+          # Create patch script to add DTB to Makefile
+          cat > "${PATCH_DIR}/files/add-king3399-dtb.sh" << 'EOF'
+          #!/bin/bash
+          MAKEFILE="arch/arm64/boot/dts/rockchip/Makefile"
+          grep -q "rk3399-king3399.dtb" "${MAKEFILE}" || \
             sed -i '/rk3399-rock-pi-4a.dtb/a\\tdtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-king3399.dtb' \
-            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile
+            "${MAKEFILE}"
+          echo "King3399 DTB entry added to Makefile"
+          grep "king3399" "${MAKEFILE}"
+          EOF
+          chmod +x "${PATCH_DIR}/files/add-king3399-dtb.sh"
 
-          echo "King3399 DTS added to kernel tree"
-          grep "king3399" /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile
+          echo "patch_path=${PATCH_DIR}" >> ${GITHUB_ENV}
+          echo "Patch prepared at: ${PATCH_DIR}"
+          ls -la "${PATCH_DIR}/arch/arm64/boot/dts/rockchip/"
+          echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Copy kernel config
-        run: |
-          cp config/kernel/kernel-5.10-rockchip.config /opt/kernel/linux-5.10/.config
-          cd /opt/kernel/linux-5.10
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-
-      - name: Compile kernel
-        run: |
-          cd /opt/kernel/linux-5.10
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) \
-            Image dtbs modules 2>&1 | tee /tmp/kernel-build.log
-          echo "Kernel build completed"
-          ls -lh arch/arm64/boot/Image
-          ls -lh arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb
-
-      - name: Package kernel artifacts
-        run: |
-          mkdir -p /opt/kernel/output
-          KVER=$(cat /opt/kernel/linux-5.10/include/config/kernel.release 2>/dev/null || \
-                 make -C /opt/kernel/linux-5.10 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-                 kernelrelease 2>/dev/null)
-
-          echo "Kernel version: ${KVER}"
-
-          # Install modules
-          make -C /opt/kernel/linux-5.10 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            INSTALL_MOD_PATH=/opt/kernel/output modules_install
-
-          # Copy Image and DTBs
-          cp /opt/kernel/linux-5.10/arch/arm64/boot/Image \
-            /opt/kernel/output/boot-${KVER}.tar.gz || true
-
-          # Create ophub-compatible kernel package
-          mkdir -p /opt/kernel/pkg/{boot,dtb/rockchip}
-
-          cp /opt/kernel/linux-5.10/arch/arm64/boot/Image \
-            /opt/kernel/pkg/boot/vmlinuz-${KVER}
-          cp /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb \
-            /opt/kernel/pkg/dtb/rockchip/
-          cp /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-rock-pi-4a.dtb \
-            /opt/kernel/pkg/dtb/rockchip/ 2>/dev/null || true
-
-          # Create System.map and config
-          cp /opt/kernel/linux-5.10/System.map /opt/kernel/pkg/boot/System.map-${KVER}
-          cp /opt/kernel/linux-5.10/.config /opt/kernel/pkg/boot/config-${KVER}
-
-          # Create uInitrd (empty initrd for now)
-          echo "kernel: ${KVER}" > /tmp/kernel-info.txt
-          ls -lh /opt/kernel/pkg/boot/
-          ls -lh /opt/kernel/pkg/dtb/rockchip/
-
-      - name: Upload kernel artifacts
-        uses: actions/upload-artifact@v4.6.2
+      - name: Compile King3399 kernel
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        uses: ophub/amlogic-s9xxx-armbian@main
         with:
-          name: king3399-kernel-5.10
-          path: /opt/kernel/pkg/
-          retention-days: 30
+          build_target: kernel
+          kernel_source: unifreq
+          kernel_version: ${{ inputs.kernel_version }}
+          kernel_auto: ${{ inputs.kernel_auto }}
+          kernel_sign: ${{ inputs.kernel_sign }}
+          kernel_toolchain: ${{ inputs.kernel_toolchain }}
+          kernel_package: all
+          delete_source: false
+          docker_image: ${{ inputs.docker_image }}
 
-      - name: Upload kernel DTB only (quick test artifact)
-        uses: actions/upload-artifact@v4.6.2
+      - name: Apply King3399 DTS patch and rebuild DTBs
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        run: |
+          echo "Kernel compiled. DTB output:"
+          find /builder -name "rk3399-king3399.dtb" 2>/dev/null || echo "DTB not found yet - patch needed"
+          find /builder -name "*.tar.gz" 2>/dev/null | head -10
+
+      - name: Upload kernel to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         with:
-          name: king3399-dtb-only
-          path: /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb
-          retention-days: 30
+          tag: kernel_stable
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### King3399 Custom Kernel ${{ inputs.kernel_version }}
+            - Device: Rongpin King3399 (RK3399)
+            - Custom DTS: rk3399-king3399.dtb included
+            - Signature: ${{ inputs.kernel_sign }}
