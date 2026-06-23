@@ -82,7 +82,7 @@ on:
         type: choice
         options:
           - -ophub
-          - -yourname
+          - rootcascadee
 
 env:
   TZ: Etc/UTC
