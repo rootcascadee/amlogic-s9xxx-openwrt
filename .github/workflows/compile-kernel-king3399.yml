@@ -48,13 +48,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Initialize environment
         run: |
           sudo -E apt-get -y update
           sudo -E apt-get -y install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libssl-dev bc flex bison libelf-dev build-essential git dtc
+            libssl-dev bc flex bison libelf-dev build-essential git \
+            device-tree-compiler u-boot-tools
           sudo timedatectl set-timezone "${TZ}"
 
       - name: Clone kernel source 5.10.y
@@ -131,14 +132,14 @@ jobs:
           ls -lh /opt/kernel/pkg/dtb/rockchip/
 
       - name: Upload kernel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: king3399-kernel-5.10
           path: /opt/kernel/pkg/
           retention-days: 30
 
       - name: Upload kernel DTB only (quick test artifact)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: king3399-dtb-only
           path: /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb
