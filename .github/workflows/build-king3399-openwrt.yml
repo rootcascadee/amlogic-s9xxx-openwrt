@@ -154,8 +154,8 @@ jobs:
           openwrt_board: king3399
           openwrt_kernel: ${{ inputs.openwrt_kernel }}
           auto_kernel: true
-          kernel_repo: ophub/kernel
-          kernel_usage: stable
+          kernel_repo: rootcascadee/kernel
+          kernel_usage: rk3399
           openwrt_ip: ${{ inputs.openwrt_ip }}
           builder_name: ${{ inputs.builder_name }}
 
@@ -188,3 +188,4 @@ jobs:
             ### Notes
             - Kernel 5.10.y recommended for best display compatibility
             - HDMI output tested and working
+            - Kernel source: `rootcascadee/kernel` @ `kernel_rk3399` release tag
