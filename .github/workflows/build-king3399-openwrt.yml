@@ -1,0 +1,190 @@
+#==========================================================================
+# Build OpenWrt for Rongpin King3399 (RK3399)
+# Uses kernel 5.10.y which is proven to work on King3399 hardware
+# Repo: https://github.com/rootcascadee/amlogic-s9xxx-openwrt
+#==========================================================================
+
+name: Build King3399 OpenWrt
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      openwrt_source:
+        description: "Select OpenWrt source"
+        required: false
+        default: "lede_master"
+        type: choice
+        options:
+          - lede_master
+          - openwrt_main
+          - immortalwrt_master
+      openwrt_kernel:
+        description: "Select kernel version"
+        required: false
+        default: "5.10.y"
+        type: choice
+        options:
+          - 5.10.y
+          - 6.1.y
+          - 6.6.y
+      openwrt_ip:
+        description: "Default IP address"
+        required: false
+        default: "192.168.1.1"
+      builder_name:
+        description: "Builder signature"
+        required: false
+        default: "rootcascadee"
+
+env:
+  TZ: Asia/Jakarta
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "${TZ}"
+          echo "BUILD_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+          echo "BUILD_TAG=King3399_OpenWrt_$(date +"%Y.%m")" >> $GITHUB_ENV
+
+      - name: Create virtual disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.xfs -f "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+
+      - name: Clone OpenWrt source [ ${{ inputs.openwrt_source }} ]
+        working-directory: /builder
+        run: |
+          case "${{ inputs.openwrt_source }}" in
+            lede_master)
+              git clone -q --depth=1 --branch=master https://github.com/coolsnowwolf/lede openwrt
+              ;;
+            openwrt_main)
+              git clone -q --depth=1 --branch=main https://github.com/openwrt/openwrt openwrt
+              ;;
+            immortalwrt_master)
+              git clone -q --depth=1 --branch=master https://github.com/immortalwrt/immortalwrt openwrt
+              ;;
+          esac
+          ln -sf /builder/openwrt ${{ github.workspace }}/openwrt
+
+      - name: Load custom feeds
+        run: |
+          SOURCE="${{ inputs.openwrt_source }}"
+          [[ -f "config/${SOURCE}/feeds.conf.default" ]] && \
+            cp -f config/${SOURCE}/feeds.conf.default openwrt/feeds.conf.default
+          chmod +x config/${SOURCE}/diy-part1.sh
+          cd openwrt && ${{ github.workspace }}/config/${SOURCE}/diy-part1.sh
+
+      - name: Update & install feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load custom config for king3399
+        run: |
+          SOURCE="${{ inputs.openwrt_source }}"
+          [[ -f "config/${SOURCE}/config" ]] && cp -f config/${SOURCE}/config openwrt/.config
+          chmod +x config/${SOURCE}/diy-part2.sh
+          cd openwrt && ${{ github.workspace }}/config/${SOURCE}/diy-part2.sh "${{ inputs.openwrt_ip }}"
+
+      - name: Download packages
+        run: |
+          cd openwrt
+          make defconfig
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile OpenWrt firmware
+        run: |
+          cd openwrt
+          echo "Compiling with $(nproc) threads..."
+          make -j$(($(nproc) + 1)) V=s || make -j1 V=s
+          echo "status=success" >> $GITHUB_ENV
+
+      - name: Prepare rootfs artifact
+        run: |
+          cd openwrt
+          mkdir -p output
+          cp -f bin/targets/*/*/*rootfs.tar.gz output/
+          cp -f .config output/config
+          ls -lh output/
+
+      - name: Upload rootfs to Release
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: ${{ env.BUILD_TAG }}
+          artifacts: openwrt/output/*
+          allow_updates: true
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package OpenWrt for King3399
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: openwrt/output/*rootfs.tar.gz
+          openwrt_board: king3399
+          openwrt_kernel: ${{ inputs.openwrt_kernel }}
+          auto_kernel: true
+          kernel_repo: ophub/kernel
+          kernel_usage: stable
+          openwrt_ip: ${{ inputs.openwrt_ip }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: Upload King3399 image to Release
+        uses: ophub/upload-to-releases@main
+        if: env.PACKAGED_STATUS == 'success'
+        with:
+          tag: ${{ env.BUILD_TAG }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## King3399 OpenWrt Image
+
+            | Item | Value |
+            |------|-------|
+            | Device | Rongpin King3399 (RK3399) |
+            | Kernel | ${{ inputs.openwrt_kernel }} |
+            | Source | ${{ inputs.openwrt_source }} |
+            | Default IP | `${{ inputs.openwrt_ip }}` |
+            | Default User | `root` |
+            | Default Password | `password` |
+            | Build Date | ${{ env.BUILD_DATE }} |
+
+            ### Install to eMMC
+            Login to OpenWrt → `System` → `Amlogic Service` → `Install OpenWrt`
+
+            ### Notes
+            - Kernel 5.10.y recommended for best display compatibility
+            - HDMI output tested and working

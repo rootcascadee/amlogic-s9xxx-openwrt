@@ -1,0 +1,145 @@
+#==========================================================================
+# Compile custom kernel for King3399 (RK3399)
+# Includes custom rk3399-king3399.dts
+# Based on ophub kernel build system
+#==========================================================================
+
+name: Compile King3399 Kernel
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Kernel version to build"
+        required: false
+        default: "5.10.y"
+        type: choice
+        options:
+          - 5.10.y
+          - 6.1.y
+          - 6.6.y
+      kernel_auto:
+        description: "Auto use latest patch version"
+        required: false
+        default: true
+        type: boolean
+      kernel_sign:
+        description: "Kernel custom signature"
+        required: false
+        default: "-king3399"
+      kernel_toolchain:
+        description: "Compilation toolchain"
+        required: false
+        default: "gcc"
+        type: choice
+        options:
+          - gcc
+          - clang
+
+env:
+  TZ: Asia/Jakarta
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize environment
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev bc flex bison libelf-dev build-essential git dtc
+          sudo timedatectl set-timezone "${TZ}"
+
+      - name: Clone kernel source 5.10.y
+        run: |
+          mkdir -p /opt/kernel
+          git clone --depth=1 --branch linux-5.10.y \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            /opt/kernel/linux-5.10
+
+      - name: Add King3399 DTS to kernel tree
+        run: |
+          # Copy custom DTS
+          cp config/kernel/rk3399-king3399.dts \
+            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/
+
+          # Add to Makefile if not present
+          grep -q "rk3399-king3399.dtb" \
+            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile || \
+            sed -i '/rk3399-rock-pi-4a.dtb/a\\tdtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-king3399.dtb' \
+            /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile
+
+          echo "King3399 DTS added to kernel tree"
+          grep "king3399" /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/Makefile
+
+      - name: Copy kernel config
+        run: |
+          cp config/kernel/kernel-5.10-rockchip.config /opt/kernel/linux-5.10/.config
+          cd /opt/kernel/linux-5.10
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Compile kernel
+        run: |
+          cd /opt/kernel/linux-5.10
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) \
+            Image dtbs modules 2>&1 | tee /tmp/kernel-build.log
+          echo "Kernel build completed"
+          ls -lh arch/arm64/boot/Image
+          ls -lh arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb
+
+      - name: Package kernel artifacts
+        run: |
+          mkdir -p /opt/kernel/output
+          KVER=$(cat /opt/kernel/linux-5.10/include/config/kernel.release 2>/dev/null || \
+                 make -C /opt/kernel/linux-5.10 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                 kernelrelease 2>/dev/null)
+
+          echo "Kernel version: ${KVER}"
+
+          # Install modules
+          make -C /opt/kernel/linux-5.10 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH=/opt/kernel/output modules_install
+
+          # Copy Image and DTBs
+          cp /opt/kernel/linux-5.10/arch/arm64/boot/Image \
+            /opt/kernel/output/boot-${KVER}.tar.gz || true
+
+          # Create ophub-compatible kernel package
+          mkdir -p /opt/kernel/pkg/{boot,dtb/rockchip}
+
+          cp /opt/kernel/linux-5.10/arch/arm64/boot/Image \
+            /opt/kernel/pkg/boot/vmlinuz-${KVER}
+          cp /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb \
+            /opt/kernel/pkg/dtb/rockchip/
+          cp /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-rock-pi-4a.dtb \
+            /opt/kernel/pkg/dtb/rockchip/ 2>/dev/null || true
+
+          # Create System.map and config
+          cp /opt/kernel/linux-5.10/System.map /opt/kernel/pkg/boot/System.map-${KVER}
+          cp /opt/kernel/linux-5.10/.config /opt/kernel/pkg/boot/config-${KVER}
+
+          # Create uInitrd (empty initrd for now)
+          echo "kernel: ${KVER}" > /tmp/kernel-info.txt
+          ls -lh /opt/kernel/pkg/boot/
+          ls -lh /opt/kernel/pkg/dtb/rockchip/
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: king3399-kernel-5.10
+          path: /opt/kernel/pkg/
+          retention-days: 30
+
+      - name: Upload kernel DTB only (quick test artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: king3399-dtb-only
+          path: /opt/kernel/linux-5.10/arch/arm64/boot/dts/rockchip/rk3399-king3399.dtb
+          retention-days: 30
